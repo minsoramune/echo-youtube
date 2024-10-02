@@ -1,111 +1,134 @@
 name: update-checker
 
 on:
-    workflow_dispatch:
+  workflow_dispatch:
 
 env:
-    status: failure
-    workflow_name: none
-    apk-path: none
-    repo-title: none
+  status: failure
+  workflow_name: none
+  apk-path: none
+  repo-title: none
 
 jobs:
-    check_for_update:
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout Repository
-              uses: actions/checkout@v4
+  check_for_update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-            - name: Run Main.go
-              id: run-main
-              run: |
-                  go run ./src/main.go --token="${{ secrets.GITHUB_TOKEN }}"
+      - name: Run Main.go
+        id: run-main
+        run: |
+          go run ./src/main.go --token="${{ secrets.GITHUB_TOKEN }}"
 
-            - name: Set Environment Variables
-              run: |
-                  echo "status=$(jq -r '.status' data/info.json)" >> $GITHUB_ENV
-                  echo "workflow_name=$(jq -r '.workflow.title' data/info.json)" >> $GITHUB_ENV
-                  echo "repo-title=$(jq -r '.workflow.repo' data/settings.json)" >> $GITHUB_ENV
-                  echo "apk-path=$(ls -S archive/*.apk | head -n 1)" >> $GITHUB_ENV
+      - name: Set Environment Variables
+        run: |
+          echo "status=$(jq -r '.status' data/info.json)" >> $GITHUB_ENV
+          echo "workflow_name=$(jq -r '.workflow.title' data/info.json)" >> $GITHUB_ENV
+          echo "repo-title=$(jq -r '.workflow.repo' data/settings.json)" >> $GITHUB_ENV
+          echo "apk-path=$(ls -S archive/*.apk | head -n 1)" >> $GITHUB_ENV
 
-            - name: Make Temporary Files
-              run: |
-                  echo "$(jq -r '.["commit-log"]' data/info.json)" > ./data/commit-log.txt
-                  # echo "$(jq -r '.["elapsed-time"]' data/info.json)" > ./data/elapsed-time.txt
+      - name: Make Commit Log
+        run: |
+          echo "$(jq -r '.["commit-log"]' data/info.json)" > ./data/commit-log.txt
 
-            - name: Get Apk Info
-              id: apk-info
-              if: ${{ env.status == 'success' }}
-              uses: hkusu/apk-info-action@v1
-              with:
-                  apk-path: ${{ env.apk-path }}
+      - name: Get Apk Info
+        id: apk-info
+        if: ${{ env.status == 'success' }}
+        uses: hkusu/apk-info-action@v1
+        with:
+          apk-path: ${{ env.apk-path }}
 
-            - name: Commit Changes
-              run: |
-                  git config --global user.email "${{ secrets.EMAIL }}"
-                  git config --global user.name "${{ github.repository_owner }}"
-                  git add .
-                  git commit -m "Update ${{ env.repo-title }} to latest version"
+      # Debug step to check apk version
+      - name: Debug APK Version
+        run: |
+          echo "APK version name: ${{ steps.apk-info.outputs['version-name'] }}"
 
-            - name: Push Changes
-              uses: ad-m/github-push-action@master
-              with:
-                  github_token: ${{ secrets.GITHUB_TOKEN }}
+      # Ensure the tag is created
+      - name: Get Existing Tag
+        id: existing-tag
+        run: |
+          existing_tag=$(git ls-remote --tags origin | grep "refs/tags/${{ steps.apk-info.outputs.version-name }}" || echo "")
+          echo "existing_tag=${existing_tag}" >> $GITHUB_ENV
 
-            - name: Delete Old Releases
-              run: |
-                  releases=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    https://api.github.com/repos/${{ github.repository }}/releases | jq -r '.[] | .id' | sort -nr)
+      - name: Delete Old Tag Locally and Remotely
+        if: ${{ env.existing_tag != '' }}
+        run: |
+          # Extract the tag name from the existing_tag
+          tag_name=$(echo "${{ env.existing_tag }}" | awk -F'/' '{print $3}')
+          
+          # Check if the tag exists locally before attempting to delete it
+          if git rev-parse "$tag_name" >/dev/null 2>&1; then
+            echo "Tag $tag_name found locally, deleting it."
+            git tag -d "$tag_name"
+          else
+            echo "Tag $tag_name not found locally, skipping local deletion."
+          fi
+          
+          # Always attempt to delete the tag from the remote
+          git push origin :refs/tags/"$tag_name"
 
-                  for release in $releases; do
-                    curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                      -H "Accept: application/vnd.github.v3+json" \
-                      https://api.github.com/repos/${{ github.repository }}/releases/$release
-                  done
-              if: ${{ env.status == 'success' }}
+      - name: Create New Git Tag
+        run: |
+          # Create new tag locally
+          git tag ${{ steps.apk-info.outputs.version-name || 'v1.0.0' }}
 
-            - name: Delete Old Tags
-              run: |
-                  tags=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    https://api.github.com/repos/${{ github.repository }}/tags | jq -r '.[] | .name')
+          # Push new tag to remote
+          git push origin ${{ steps.apk-info.outputs.version-name || 'v1.0.0' }}
 
-                  for tag in $tags; do
-                    curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                      -H "Accept: application/vnd.github.v3+json" \
-                      https://api.github.com/repos/${{ github.repository }}/git/refs/tags/$tag
-                  done
-              if: ${{ env.status == 'success' }}
+      - name: Commit Changes
+        run: |
+          git config --global user.email "apk-artifacts-downloader@github.com"
+          git config --global user.name "${{ github.repository_owner }}"
+          git add .
+          git commit -m "Update ${{ env.repo-title }} to latest version"
 
-            - name: Publish Release
-              uses: softprops/action-gh-release@v2
-              if: ${{ env.status == 'success' }}
-              with:
-                  files: ./archive/*.apk
-                  tag_name: ${{ steps.apk-info.outputs.version-name }}
-                  name: ${{ env.workflow_name }}
-                  body_path: ./data/commit-log.txt
+      - name: Push Changes
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
-    rerun-workflow:
-        name: Re-run workflow
-        needs: check_for_update
-        if: success() || failure()
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout Repository
-              uses: actions/checkout@v4
+      - name: Delete Old Releases
+        run: |
+          releases=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/releases | jq -r '.[] | .id' | sort -nr)
 
-            - name: Wait for 5 minutes
-              run: |
-                  elapsed_time=$(jq -r '.["elapsed-time"]' data/info.json)
+          for release in $releases; do
+            curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/releases/$release
+          done
+        if: ${{ env.status == 'success' }}
 
-                  if [ $elapsed_time -lt 300 ]; then
-                    sleep $((300 - elapsed_time))
-                  fi
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        if: ${{ env.status == 'success' }}
+        with:
+          files: ./archive/*.apk
+          tag_name: ${{ steps.apk-info.outputs.version-name || 'v1.0.0' }}
+          name: ${{ env.workflow_name }}
+          body_path: ./data/commit-log.txt
 
-            - name: Re-trigger workflow
-              run: gh workflow run checker.yaml
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-                  GH_REPO: ${{ github.repository }}
+  rerun-workflow:
+    name: Re-run workflow
+    needs: check_for_update
+    if: success() || failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Wait for 5 minutes
+        run: |
+          elapsed_time=$(jq -r '.["elapsed-time"]' data/info.json)
+
+          if [ $elapsed_time -lt 300 ]; then
+            sleep $((300 - elapsed_time))
+          fi
+
+      - name: Re-trigger workflow
+        run: gh workflow run checker.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
